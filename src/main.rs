@@ -108,7 +108,6 @@ fn analyze_file(file_path: PathBuf) -> Result<()> {
     let _ = command.take_stdout().unwrap().read_to_string(&mut stdout)?;
     let _ = command.take_stderr().unwrap().read_to_string(&mut stderr)?;
     let status = command.wait()?;
-    info!(
-        "FFmpeg command exited with status: {status} out: {stdout} \n err: {stderr}");
+    info!("FFmpeg command exited with status: {status} out: {stdout} \n err: {stderr}");
     Ok(())
 }

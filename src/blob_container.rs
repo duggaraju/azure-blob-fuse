@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use azure_core::Bytes;
 use azure_core::time::OffsetDateTime;
 use azure_storage_blob::BlobContainerClient;
+use azure_storage_blob::models::BlobClientDownloadOptions;
 use fuser::{FUSE_ROOT_ID, FileAttr};
 use futures::StreamExt;
 use log::{error, info};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::time::{Instant, SystemTime};
 
@@ -16,7 +18,8 @@ pub struct BlobInfo {
     pub size: u64,
     pub last_modified: SystemTime,
     pub inode: u64,
-    pub data: Option<Bytes>, // Optional data for the blob, can be used for caching
+    pub cache: Option<Bytes>, // Optional data for the blob, can be used for caching
+    pub cache_range: Range<i64>, // Range for cached data
 }
 
 impl BlobInfo {
@@ -26,32 +29,41 @@ impl BlobInfo {
             size,
             last_modified,
             inode,
-            data: None, // Data can be set later if needed
+            cache: None,       // Data can be set later if needed
+            cache_range: 0..0, // Default range, can be updated later
         }
     }
 
-    async fn download(&mut self, client: &BlobContainerClient) -> Result<Bytes> {
-        match self.data {
-            Some(ref data) => Ok(data.clone()),
-            None => {
-                let data = client
-                    .blob_client(self.name.clone())
-                    .download(None)
-                    .await
-                    .context(format!("Failed to download blob: {}", self.name))?
-                    .into_raw_body()
-                    .collect()
-                    .await?;
-                self.data = Some(data.clone());
-                Ok(data)
-            }
+    async fn download(&mut self, client: &BlobContainerClient, range: Range<i64>) -> Result<Bytes> {
+        if self.cache.is_some() && self.cache_range == range {
+            info!("Using cached data for blob: {}", self.name);
+            return Ok(self.cache.clone().unwrap_or_default());
         }
+
+        let options = BlobClientDownloadOptions {
+            range: Some(format!("bytes={}-{}", range.start, range.end - 1)),
+            ..Default::default()
+        };
+        let data = client
+            .blob_client(self.name.clone())
+            .download(Some(options))
+            .await
+            .context(format!("Failed to download blob: {}", self.name))?
+            .into_raw_body()
+            .collect()
+            .await?;
+        self.cache = Some(data.clone());
+        Ok(data)
     }
 
     /// Synchronous method to download blob content
-    pub fn download_sync(&mut self, client: &BlobContainerClient) -> Result<Bytes> {
+    pub fn download_sync(
+        &mut self,
+        client: &BlobContainerClient,
+        range: Range<i64>,
+    ) -> Result<Bytes> {
         let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(self.download(client))
+        runtime.block_on(self.download(client, range))
     }
 }
 
@@ -225,7 +237,8 @@ impl BlobContainer {
                             size,
                             last_modified,
                             inode,
-                            data: None,
+                            cache: None,
+                            cache_range: 0..0, // Default range, can be updated later
                         };
 
                         self.inode_map.insert(inode, blob_name.clone());
@@ -303,9 +316,9 @@ impl BlobContainer {
             .and_then(|blob_name| self.blob_cache.get_mut(blob_name));
 
         if let Some(BlobEntry::File(blob)) = entry {
-            let data = blob.download_sync(&self.container_client)?;
-            let end = (offset as usize + size as usize).min(data.len());
-            Ok(data.slice(offset as usize..end))
+            let end = offset + size as i64;
+            let data = blob.download_sync(&self.container_client, Range { start: offset, end })?;
+            Ok(data)
         } else {
             Err(anyhow::format_err!("Blob with inode {} not found", inode))
         }
